@@ -1,4 +1,3 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
 diff --git a/README.md b/README.md
 new file mode 100644
 index 0000000000000000000000000000000000000000..79badbd4f8c6603dd45e9a05fb0e4cbb96f7901f
@@ -119,6 +118,3 @@ index 0000000000000000000000000000000000000000..79badbd4f8c6603dd45e9a05fb0e4cbb
 +5. 監査ログ/読取ログ実装
 +6. フロント画面（読取・検索・編集）実装
 +
- 
-EOF
-)
