@@ -1,114 +1,186 @@
-# 資産バーコード管理アプリ 要件定義
+# バーコード資産管理アプリ バックエンド設計（初版）
 
-本リポジトリは、バーコードを用いた資産棚卸し・検索・登録編集を行うアプリの仕様を定義します。
+このドキュメントは `README.md` の要件を実装するための、API・DB・処理フローの初期設計です。
 
-## 目的
-- 資産にバーコードを貼付し、読み取りで資産特定と確認記録を効率化する。
-- Excel/CSVで管理されている資産リストを取り込み、検索・更新・棚卸しに活用する。
-
-## 想定データソース
-- 取込フォーマット: Excel (`.xlsx`) / CSV (`.csv`)
-- 主キー: `barcode`（重複不可）
+## 1. 想定アーキテクチャ
+- クライアント: Web（バーコードリーダー入力/カメラ入力）
+- API: REST
+- DB: RDBMS（PostgreSQL想定）
+- ファイル取込: CSV/XLSXをサーバーでパースしてバリデーション
 
 ---
 
-## 1. 読み取り機能
+## 2. DBスキーマ（DDL案）
 
-### 要件
-- バーコード読取時、登録済み資産から一致検索し、資産詳細をポップアップ表示する。
-- 一致資産の `last_confirmed_at`（確認日）を更新する。
-- 連続読取を可能とし、1件処理後は自動で次の読取待受に戻る。
-- 未登録バーコードはエラー表示し、エラーログへ記録する。
+```sql
+CREATE TABLE assets (
+  asset_id            UUID PRIMARY KEY,
+  barcode             VARCHAR(128) NOT NULL UNIQUE,
+  asset_name          VARCHAR(255) NOT NULL,
+  category            VARCHAR(100),
+  location            VARCHAR(255),
+  registered_at       DATE NOT NULL,
+  last_confirmed_at   TIMESTAMP NULL,
+  status              VARCHAR(50) NOT NULL DEFAULT 'active',
+  is_deleted          BOOLEAN NOT NULL DEFAULT FALSE,
+  deleted_at          TIMESTAMP NULL,
+  deleted_by          VARCHAR(100) NULL,
+  delete_comment      TEXT NULL,
+  created_at          TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at          TIMESTAMP NOT NULL DEFAULT NOW()
+);
 
-### UX要件
-- 連続読取中でも画面遷移しない。
-- 同一コードの短時間重複読み取りを抑止（例: 1〜2秒デバウンス）。
-- 成功・失敗をトースト表示し、直近履歴を画面に残す。
+CREATE INDEX idx_assets_name ON assets(asset_name);
+CREATE INDEX idx_assets_registered_at ON assets(registered_at);
+CREATE INDEX idx_assets_last_confirmed_at ON assets(last_confirmed_at);
+CREATE INDEX idx_assets_active ON assets(is_deleted, status);
+
+CREATE TABLE scan_logs (
+  scan_log_id         BIGSERIAL PRIMARY KEY,
+  scanned_code        VARCHAR(128) NOT NULL,
+  result              VARCHAR(20) NOT NULL, -- success / not_found / error
+  asset_id            UUID NULL,
+  message             VARCHAR(500),
+  scanned_at          TIMESTAMP NOT NULL DEFAULT NOW(),
+  scanned_by          VARCHAR(100) NULL
+);
+
+CREATE INDEX idx_scan_logs_scanned_at ON scan_logs(scanned_at);
+CREATE INDEX idx_scan_logs_code ON scan_logs(scanned_code);
+
+CREATE TABLE audit_logs (
+  audit_log_id        BIGSERIAL PRIMARY KEY,
+  action              VARCHAR(20) NOT NULL, -- create / update / delete / import
+  target_asset_id     UUID NULL,
+  before_json         JSONB NULL,
+  after_json          JSONB NULL,
+  acted_at            TIMESTAMP NOT NULL DEFAULT NOW(),
+  acted_by            VARCHAR(100) NULL,
+  comment             VARCHAR(500) NULL
+);
+
+CREATE INDEX idx_audit_logs_acted_at ON audit_logs(acted_at);
+CREATE INDEX idx_audit_logs_target ON audit_logs(target_asset_id);
+```
 
 ---
 
-## 2. 検索機能
+## 3. API設計（v1）
 
-### 検索条件
-- 確認日（From / To）
-- 登録日（From / To）
-- 資産名称（部分一致）
-- バーコード（完全一致）
-- 設置場所 / カテゴリ（任意）
+## 3.1 バーコード読取
+### `POST /api/v1/scan`
 
-### 棚卸し支援
-- 「未確認資産のみ」抽出:
+**Request**
+```json
+{
+  "barcode": "ABC-000123",
+  "scanned_by": "user01"
+}
+```
+
+**Success (200)**
+```json
+{
+  "result": "success",
+  "asset": {
+    "asset_id": "...",
+    "barcode": "ABC-000123",
+    "asset_name": "ノートPC",
+    "location": "3F-営業部",
+    "last_confirmed_at": "2026-05-18T09:00:00Z"
+  }
+}
+```
+
+**Not Found (404)**
+```json
+{
+  "result": "not_found",
+  "message": "asset not found for barcode"
+}
+```
+
+**処理要点**
+1. `barcode` を正規化（前後空白除去）
+2. `assets` から `is_deleted = false` で検索
+3. 見つかれば `last_confirmed_at = NOW()` 更新
+4. `scan_logs` 記録
+5. 結果返却
+
+---
+
+## 3.2 資産検索
+### `GET /api/v1/assets`
+
+**Query Parameters**
+- `asset_name` (partial)
+- `barcode` (exact)
+- `registered_from`, `registered_to`
+- `confirmed_from`, `confirmed_to`
+- `location`, `category`
+- `unconfirmed_only` (`true/false`)
+- `inventory_from`, `inventory_to` （棚卸し期間）
+- `page`, `page_size`
+
+**棚卸し未確認ロジック（例）**
+- `unconfirmed_only=true` の時、下記条件を適用
   - `last_confirmed_at IS NULL`
-  - または指定棚卸し期間に未確認
-- 検索結果のCSVエクスポート
+  - または `last_confirmed_at < inventory_from`
 
 ---
 
-## 3. 登録・編集・削除機能
+## 3.3 資産登録
+### `POST /api/v1/assets`
+- `barcode` 重複時は `409 Conflict`
+- 成功時に `audit_logs(action=create)` を記録
 
-### 登録
-- 新規資産を登録可能。
-- 必須項目: `barcode`, `asset_name`, `registered_at`。
+## 3.4 資産更新
+### `PUT /api/v1/assets/{asset_id}`
+- 更新前後の差分を `audit_logs` に保存
 
-### 編集
-- 資産名称、カテゴリ、設置場所、状態等を更新可能。
-- 更新者・更新日時を保存。
+## 3.5 資産削除（論理削除）
+### `DELETE /api/v1/assets/{asset_id}`
 
-### 削除
-- 論理削除を採用（`is_deleted = true`）。
-- 削除時にコメント入力を必須化。
-- 削除操作を監査ログに記録（実行者、日時、コメント）。
+**Request**
+```json
+{
+  "deleted_by": "user01",
+  "delete_comment": "廃棄済みのため"
+}
+```
 
----
-
-## データモデル（最小）
-
-| カラム | 型 | 説明 |
-|---|---|---|
-| asset_id | UUID / BIGINT | 内部ID |
-| barcode | string | バーコード（ユニーク） |
-| asset_name | string | 資産名称 |
-| category | string | 分類 |
-| location | string | 設置場所 |
-| registered_at | date/datetime | 登録日 |
-| last_confirmed_at | datetime nullable | 最終確認日 |
-| status | string | 利用状態（active/disposed など） |
-| is_deleted | boolean | 論理削除フラグ |
-| deleted_at | datetime nullable | 削除日時 |
-| deleted_by | string nullable | 削除者 |
-| delete_comment | text nullable | 削除コメント |
-| created_at | datetime | 作成日時 |
-| updated_at | datetime | 更新日時 |
+**ルール**
+- `delete_comment` 必須
+- `is_deleted=true`, `deleted_at`, `deleted_by`, `delete_comment` を更新
+- `audit_logs(action=delete)` 記録
 
 ---
 
-## ログ要件
-
-### 読取ログ
-- `scan_logs` に成功/失敗を記録
-- 項目例: `scanned_code`, `result`, `asset_id`, `message`, `scanned_at`, `scanned_by`
-
-### 監査ログ
-- 登録・編集・削除の変更履歴を記録
-- 項目例: `action`, `target_asset_id`, `before_json`, `after_json`, `acted_at`, `acted_by`
-
----
-
-## 受け入れ基準（抜粋）
-
-1. 登録済みバーコードを読み取ると、1秒以内に資産情報が表示され、確認日が当日更新される。
-2. 未登録バーコードは資産更新されず、エラーが表示される。
-3. 検索画面で「未確認資産のみ」を指定すると、確認日未入力または期間外の資産だけが表示される。
-4. 削除時にコメント未入力では削除できない。
-5. 削除実行時、監査ログに記録が残る。
+## 3.6 インポート
+### `POST /api/v1/assets/import`
+- 対応: `csv`, `xlsx`
+- バリデーション:
+  - 必須欠損（barcode, asset_name, registered_at）
+  - barcode重複（ファイル内・DB内）
+  - 日付フォーマット
+- 検証結果を行番号付きで返却
 
 ---
 
-## 次フェーズ（実装タスク）
-1. CSV/Excel取込バリデータ実装（重複・必須欠損チェック）
-2. 資産マスタCRUD API実装
-3. バーコード読取API（確認日更新含む）
-4. 検索API（未確認抽出対応）
-5. 監査ログ/読取ログ実装
-6. フロント画面（読取・検索・編集）実装
+## 4. エラーコード方針
+- `400` リクエスト不正
+- `404` 該当データなし
+- `409` 重複（barcode）
+- `422` バリデーションエラー
+- `500` サーバー内部エラー
+
+---
+
+## 5. 実装優先順（推奨）
+1. DBマイグレーション（assets/scan_logs/audit_logs）
+2. `POST /scan` と連続読取UIの疎通
+3. `GET /assets`（未確認抽出を含む）
+4. CRUD + 論理削除 + 監査ログ
+5. import機能（csv/xlsx）
+6. CSVエクスポート
 
