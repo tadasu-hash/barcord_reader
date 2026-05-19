@@ -128,14 +128,3 @@ python run_app.py
 ```bash
 uvicorn app:app --reload
 ```
-
-
-## テストDBの作成（テキストで管理可能）
-- `asset_manager.db` はバイナリのため、GitHub上で中身を直接確認しづらいです。
-- 代わりに、以下のスクリプトでいつでも同じテストDBを再生成できます。
-
-```bash
-python scripts_create_test_db.py
-```
-
-- 上記を実行すると、`assets` / `scan_logs` / `audit_logs` のテーブルを作成し、`assets` が空ならサンプルデータを投入します。
