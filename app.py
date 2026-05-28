@@ -122,7 +122,7 @@ input{width:100%;max-width:420px}.row{display:grid;grid-template-columns:1fr 1fr
 <p>この画面は日本語で、一般ユーザー向けに最小操作だけに絞っています。</p>
 
 <div class="card"><h2>1) バーコード読み取り（手入力でも可）</h2>
-<input id="scanBarcode" placeholder="例: ABC-000123"><button onclick="scan()">読み取る</button>
+<input id="scanBarcode" placeholder="例: ABC-000123" autofocus onkeydown="onScanKey(event)"><button onclick="scan()">読み取る</button>
 <div id="scanResult"></div></div>
 
 <div class="card"><h2>2) 資産を登録</h2>
@@ -132,21 +132,27 @@ input{width:100%;max-width:420px}.row{display:grid;grid-template-columns:1fr 1fr
 
 <div class="card"><h2>3) 資産検索</h2>
 <div class="row"><input id="qName" placeholder="資産名（部分一致）"><input id="qBarcode" placeholder="バーコード（完全一致）"></div>
-<label><input id="qUnconfirmed" type="checkbox"> 未確認資産のみ</label><br>
+<div class="row"><input id="qConfirmedFrom" type="date" placeholder="照合日From"><input id="qConfirmedTo" type="date" placeholder="照合日To"></div>
+<label><input id="qUnconfirmed" type="checkbox"> 未確認資産のみ</label>
+<label><input id="qNotConfirmedInPeriod" type="checkbox"> 指定期間に未照合のみ</label><br>
 <button onclick="searchAssets()">検索する</button>
 <div id="searchResult"></div></div>
 
 <script>
 function show(id, msg, ok=true){document.getElementById(id).innerHTML='<p class="'+(ok?'ok':'err')+'">'+msg+'</p>'}
+function focusScanInput(){const el=document.getElementById('scanBarcode');el.focus();el.select();}
+function onScanKey(event){if(event.key==='Enter'){event.preventDefault();scan();}}
 async function scan(){
  const barcode=document.getElementById('scanBarcode').value.trim();
  if(!barcode){show('scanResult','バーコードを入力してください',false);return;}
  const r=await fetch('/api/v1/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({barcode})});
  const d=await r.json();
- if(!r.ok){show('scanResult','未登録です: '+(d.detail?.message||'エラー'),false);return;}
+ if(!r.ok){show('scanResult','未登録です: '+(d.detail?.message||'エラー'),false);focusScanInput();return;}
  show('scanResult','確認OK: '+d.asset.asset_name+'（最終確認: '+d.asset.last_confirmed_at+'）');
  document.getElementById('scanBarcode').value='';
+ focusScanInput();
 }
+
 async function createAsset(){
  const payload={barcode:newBarcode.value.trim(),asset_name:newName.value.trim(),registered_at:newDate.value.trim(),location:newLocation.value.trim()||null};
  const r=await fetch('/api/v1/assets',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -159,6 +165,9 @@ async function searchAssets(){
  if(qName.value.trim())p.set('asset_name',qName.value.trim());
  if(qBarcode.value.trim())p.set('barcode',qBarcode.value.trim());
  if(qUnconfirmed.checked)p.set('unconfirmed_only','true');
+ if(qConfirmedFrom.value)p.set('confirmed_from',qConfirmedFrom.value);
+ if(qConfirmedTo.value)p.set('confirmed_to',qConfirmedTo.value);
+ if(qNotConfirmedInPeriod.checked)p.set('not_confirmed_in_period','true');
  const r=await fetch('/api/v1/assets?'+p.toString());
  const d=await r.json();
  if(!r.ok){show('searchResult','検索失敗',false);return;}
@@ -166,6 +175,7 @@ async function searchAssets(){
  for(const x of d.items){html+=`<tr><td>${x.barcode||''}</td><td>${x.asset_name||''}</td><td>${x.location||''}</td><td>${x.last_confirmed_at||'未確認'}</td></tr>`}
  html+='</table>';document.getElementById('searchResult').innerHTML=html;
 }
+window.addEventListener('load',()=>focusScanInput());
 </script></body></html>
 """
 
@@ -197,7 +207,14 @@ def scan_asset(req: ScanRequest) -> dict[str, Any]:
 
 
 @app.get("/api/v1/assets")
-def list_assets(asset_name: str | None = None, barcode: str | None = None, unconfirmed_only: bool = False) -> dict[str, Any]:
+def list_assets(
+    asset_name: str | None = None,
+    barcode: str | None = None,
+    unconfirmed_only: bool = False,
+    confirmed_from: str | None = None,
+    confirmed_to: str | None = None,
+    not_confirmed_in_period: bool = False,
+) -> dict[str, Any]:
     query = "SELECT * FROM assets WHERE is_deleted = 0"
     params: list[Any] = []
     if asset_name:
@@ -208,6 +225,16 @@ def list_assets(asset_name: str | None = None, barcode: str | None = None, uncon
         params.append(barcode)
     if unconfirmed_only:
         query += " AND last_confirmed_at IS NULL"
+    if confirmed_from and confirmed_to and not_confirmed_in_period:
+        query += " AND (last_confirmed_at IS NULL OR date(last_confirmed_at) < date(?) OR date(last_confirmed_at) > date(?))"
+        params.extend([confirmed_from, confirmed_to])
+    else:
+        if confirmed_from:
+            query += " AND date(last_confirmed_at) >= date(?)"
+            params.append(confirmed_from)
+        if confirmed_to:
+            query += " AND date(last_confirmed_at) <= date(?)"
+            params.append(confirmed_to)
     with closing(get_conn()) as conn:
         rows = [dict(r) for r in conn.execute(query, params).fetchall()]
     return {"count": len(rows), "items": rows}
